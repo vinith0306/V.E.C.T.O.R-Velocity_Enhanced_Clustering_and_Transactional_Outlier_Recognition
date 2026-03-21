@@ -7,9 +7,11 @@ import uuid
 import platform
 import json
 import smtplib
+import numpy as np
 from email.mime.text import MIMEText
 import secrets
 from streamlit_js_eval import streamlit_js_eval
+from common_constants import MERCHANT_MAP, DEVICE_MAP, PAYMENT_METHOD_MAP
 
 # -------------------------------
 # Email Configuration
@@ -52,11 +54,11 @@ st.markdown("""
     
     /* Custom header */
     .vector-header {
-        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+        background: linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%);
         padding: 20px 40px;
-        color: white;
+        color: #d4af37;
         margin: -1rem -1rem 2rem -1rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        box-shadow: 0 8px 16px rgba(212, 175, 55, 0.15);
     }
     
     .vector-title {
@@ -109,8 +111,8 @@ st.markdown("""
     
     .nav-tab.active {
         background: white;
-        color: #2a5298;
-        border-bottom: 3px solid #2a5298;
+        color: #1a1a1a;
+        border-bottom: 3px solid #d4af37;
     }
     
     /* Cards */
@@ -126,10 +128,10 @@ st.markdown("""
     .card-header {
         font-size: 1.3rem;
         font-weight: 600;
-        color: #2c3e50;
+        color: #1a1a1a;
         margin-bottom: 20px;
         padding-bottom: 10px;
-        border-bottom: 2px solid #f1f3f4;
+        border-bottom: 2px solid #d4af37;
     }
     
     /* Form styling */
@@ -146,18 +148,18 @@ st.markdown("""
     .stTextInput > div > div > input:focus,
     .stNumberInput > div > div > input:focus,
     .stSelectbox > div > div > select:focus {
-        border-color: #2a5298 !important;
-        box-shadow: 0 0 0 3px rgba(42, 82, 152, 0.1) !important;
+        border-color: #d4af37 !important;
+        box-shadow: 0 0 0 3px rgba(212, 175, 55, 0.1) !important;
     }
     
     /* Button styling */
     .stButton > button {
-        background: linear-gradient(135deg, #2a5298 0%, #1e3c72 100%) !important;
-        color: white !important;
-        border: none !important;
+        background: linear-gradient(135deg, #d4af37 0%, #c9a826 100%) !important;
+        color: #1a1a1a !important;
+        border: 2px solid #1a1a1a !important;
         border-radius: 8px !important;
         padding: 12px 30px !important;
-        font-weight: 600 !important;
+        font-weight: 700 !important;
         font-size: 16px !important;
         transition: all 0.3s ease !important;
         width: 100% !important;
@@ -165,7 +167,7 @@ st.markdown("""
     
     .stButton > button:hover {
         transform: translateY(-2px) !important;
-        box-shadow: 0 6px 12px rgba(42, 82, 152, 0.3) !important;
+        box-shadow: 0 8px 16px rgba(212, 175, 55, 0.3) !important;
     }
     
     /* Status indicators */
@@ -212,11 +214,11 @@ st.markdown("""
     
     /* 2FA styling */
     .twofa-container {
-        background: linear-gradient(135deg, #fff8e1 0%, #ffecb3 100%);
+        background: linear-gradient(135deg, #fffbf0 0%, #fff5e1 100%);
         border-radius: 10px;
         padding: 20px;
         margin: 20px 0;
-        border-left: 4px solid #ffa000;
+        border-left: 4px solid #d4af37;
     }
     
     /* Responsive design */
@@ -241,20 +243,33 @@ st.markdown("""
 # -------------------------------
 # MongoDB Setup
 # -------------------------------
-@st.cache_resource
 def init_mongo():
-    mongo_client = pymongo.MongoClient("mongodb://localhost:27017/")
-    db = mongo_client["RedisTransactions"]
-    return db["fraud_transactions"], db["legit_transactions"]
+    try:
+        mongo_client = pymongo.MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
+        db = mongo_client["RedisTransactions"]
+        return db["fraud_transactions"], db["legit_transactions"]
+    except Exception as e:
+        print(f"MongoDB connection failed: {str(e)}")
+        return None, None
 
 fraud_collection, legit_collection = init_mongo()
+
+# Show warning if MongoDB is unavailable
+if fraud_collection is None or legit_collection is None:
+    import time
+    time.sleep(1)  # Brief delay to allow app to start
 
 # -------------------------------
 # Redis Setup
 # -------------------------------
-@st.cache_resource
 def init_redis():
-    return redis.Redis(host='localhost', port=6379, decode_responses=True)
+    try:
+        r = redis.Redis(host='localhost', port=6379, decode_responses=True, socket_connect_timeout=2)
+        r.ping()
+        return r
+    except Exception as e:
+        print(f"Redis connection failed: {str(e)}")
+        return None
 
 r = init_redis()
 stream_name = 'custom_input_stream'
@@ -280,6 +295,8 @@ if "verification_txn" not in st.session_state:
     st.session_state.verification_txn = None
 if "verification_attempts" not in st.session_state:
     st.session_state.verification_attempts = 0
+if "transaction_in_progress" not in st.session_state:
+    st.session_state.transaction_in_progress = False
 
 # -------------------------------
 # Device Detection
@@ -314,7 +331,7 @@ def get_device_type():
 # -------------------------------
 # SVG Icons
 # -------------------------------
-def get_svg_icon(icon_name, size=24, color="#2a5298"):
+def get_svg_icon(icon_name, size=24, color="#1a1a1a"):
     icons = {
         "bank": f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="{color}">
                    <path d="M12 2L2 7V9H22V7L12 2Z"/>
@@ -352,32 +369,32 @@ def get_svg_icon(icon_name, size=24, color="#2a5298"):
 # -------------------------------
 def send_verification_email(user_id, verification_code):
     """Send verification email to user"""
-    recipient = EMAIL_CONFIG["user_mapping"].get(user_id, EMAIL_CONFIG["user_mapping"]["default"])
-    
-    subject = "V.E.C.T.O.R Banking - Transaction Verification Code"
-    body = f"""
-    <html>
-    <body>
-        <h2 style="color: #2a5298;">Transaction Verification</h2>
-        <p>Your verification code is: <strong>{verification_code}</strong></p>
-        <p>This code is valid for 10 minutes.</p>
-        <p style="color: #666; font-size: 12px;">If you didn't initiate this transaction, please contact our support immediately.</p>
-    </body>
-    </html>
-    """
-    
-    msg = MIMEText(body, 'html')
-    msg['Subject'] = subject
-    msg['From'] = EMAIL_CONFIG["sender"]
-    msg['To'] = recipient
-    
     try:
+        recipient = EMAIL_CONFIG["user_mapping"].get(user_id, EMAIL_CONFIG["user_mapping"]["default"])
+        
+        subject = "V.E.C.T.O.R Banking - Transaction Verification Code"
+        body = f"""
+        <html>
+        <body>
+            <h2 style="color: #2a5298;">Transaction Verification</h2>
+            <p>Your verification code is: <strong>{verification_code}</strong></p>
+            <p>This code is valid for 10 minutes.</p>
+            <p style="color: #666; font-size: 12px;">If you didn't initiate this transaction, please contact our support immediately.</p>
+        </body>
+        </html>
+        """
+        
+        msg = MIMEText(body, 'html')
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_CONFIG["sender"]
+        msg['To'] = recipient
+        
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp_server:
             smtp_server.login(EMAIL_CONFIG["sender"], EMAIL_CONFIG["password"])
             smtp_server.send_message(msg)
         return True
     except Exception as e:
-        st.error(f"Failed to send verification email: {str(e)}")
+        print(f"Email error: {str(e)}")
         return False
 
 # -------------------------------
@@ -407,20 +424,15 @@ def render_header():
 # -------------------------------
 def render_navigation():
     if st.session_state.logged_in:
-        st.markdown("""
-        <div class="nav-container">
-            <div class="nav-tabs">
-        """, unsafe_allow_html=True)
-        
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            if st.button(f"Dashboard", key="nav_dashboard", use_container_width=True):
+            if st.button("Dashboard", key="nav_dashboard", use_container_width=True):
                 st.session_state.current_page = "dashboard"
                 st.rerun()
         
         with col2:
-            if st.button(f"New Transaction", key="nav_transaction", use_container_width=True):
+            if st.button("New Transaction", key="nav_transaction", use_container_width=True):
                 st.session_state.current_page = "transaction"
                 if not st.session_state.session_timer_started:
                     st.session_state.start_time = time.time()
@@ -428,7 +440,7 @@ def render_navigation():
                 st.rerun()
         
         with col3:
-            if st.button(f"Transaction History", key="nav_history", use_container_width=True):
+            if st.button("Transaction History", key="nav_history", use_container_width=True):
                 st.session_state.current_page = "history"
                 st.rerun()
         
@@ -439,23 +451,35 @@ def render_navigation():
                         del st.session_state[key]
                 st.session_state.current_page = "login"
                 st.rerun()
-        
-        st.markdown("</div></div>", unsafe_allow_html=True)
 
 # -------------------------------
 # Login Page
 # -------------------------------
 def render_login():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="card-header">Secure Authentication</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card" style="border: 2px solid #d4af37;">', unsafe_allow_html=True)
+    st.markdown(f'<div class="card-header" style="color: #1a1a1a; border-bottom: 3px solid #d4af37;">SECURE AUTHENTICATION</div>', unsafe_allow_html=True)
     
     with st.form("login_form", clear_on_submit=False):
         col1, col2 = st.columns([1, 1])
         
         with col1:
+            st.markdown(f"""
+            <div class="vector-header" style="margin: 0; padding: 15px; border-radius: 8px;">
+                <h1 style="font-size: 20px; margin: 0; color: #d4af37; text-align: center;">V.E.C.T.O.R</h1>
+                <p style="font-size: 12px; margin: 5px 0 0 0; opacity: 0.9; text-align: center; color: #d4af37;">Banking Portal</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
             user_id = st.text_input("User ID", placeholder="Enter your unique user ID")
         
         with col2:
+            st.markdown(f"""
+            <div class="status-card" style="background: linear-gradient(135deg, #f9f9f9 0%, #ffffff 100%); border-left: 4px solid #d4af37; margin: 0; padding: 15px; border-radius: 8px;">
+                <p style="margin: 0; color: #1a1a1a; font-size: 12px; font-weight: 600;">LOGIN</p>
+                <p style="margin: 5px 0 0 0; color: #666; font-size: 11px;">Secure Access</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
             password = st.text_input("Password", type="password", placeholder="Enter VECTOR123")
         
         new_user = st.checkbox("New User Registration")
@@ -472,7 +496,7 @@ def render_login():
                 st.session_state.current_page = "dashboard"
                 
                 if new_user:
-                    st.session_state.active_loans = active_loans if new_user else 0
+                    st.session_state.active_loans = active_loans
                     st.success(f"✓ Successfully registered {user_id} with {active_loans} active loans.")
                 else:
                     st.session_state.active_loans = 0
@@ -487,13 +511,13 @@ def render_login():
     
     # Security notice
     st.markdown("""
-    <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin-top: 20px; border-left: 4px solid #2a5298;">
+    <div style="background: linear-gradient(135deg, #f0f0f0 0%, #ffffff 100%); padding: 20px; border-radius: 10px; margin-top: 20px; border-left: 4px solid #d4af37;">
         <div style="display: flex; align-items: center; margin-bottom: 10px;">
-            <strong style="color: #2a5298;">Security Notice</strong>
+            <strong style="color: #1a1a1a;">SECURITY NOTICE</strong>
         </div>
-        <p style="margin: 0; color: #666; font-size: 14px;">
+        <p style="margin: 0; color: #333; font-size: 14px;">
             This is a secure transaction monitoring system. All activities are logged and monitored for security purposes.
-            Default password: <code>VECTOR123</code>
+            Default password: <code style="background: #d4af37; padding: 2px 6px; border-radius: 4px; color: #1a1a1a;">VECTOR123</code>
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -509,8 +533,8 @@ def render_dashboard():
     
     with col1:
         st.markdown(f"""
-        <div class="status-card">
-            <h3 style="margin: 0; color: #2a5298;">User ID</h3>
+        <div class="status-card" style="border-left: 4px solid #d4af37;">
+            <h3 style="margin: 0; color: #1a1a1a;">User ID</h3>
             <p style="margin: 5px 0 0 0; font-size: 18px; font-weight: 600;">{st.session_state.user_id}</p>
         </div>
         """, unsafe_allow_html=True)
@@ -518,8 +542,8 @@ def render_dashboard():
     with col2:
         active_loans = st.session_state.active_loans if st.session_state.active_loans is not None else 0
         st.markdown(f"""
-        <div class="status-card">
-            <h3 style="margin: 0; color: #2a5298;">Active Loans</h3>
+        <div class="status-card" style="border-left: 4px solid #d4af37;">
+            <h3 style="margin: 0; color: #1a1a1a;">Active Loans</h3>
             <p style="margin: 5px 0 0 0; font-size: 18px; font-weight: 600;">{active_loans}</p>
         </div>
         """, unsafe_allow_html=True)
@@ -527,46 +551,48 @@ def render_dashboard():
     with col3:
         device_type = get_device_type()
         st.markdown(f"""
-        <div class="status-card">
-            <h3 style="margin: 0; color: #2a5298;">Device Type</h3>
+        <div class="status-card" style="border-left: 4px solid #d4af37;">
+            <h3 style="margin: 0; color: #1a1a1a;">Device Type</h3>
             <p style="margin: 5px 0 0 0; font-size: 18px; font-weight: 600;">{device_type}</p>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Quick stats
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="card-header">Account Overview</div>', unsafe_allow_html=True)
     
-    # Get transaction counts
-    legit_count = legit_collection.count_documents({"User_ID": st.session_state.user_id})
-    fraud_count = fraud_collection.count_documents({"User_ID": st.session_state.user_id})
+    # Get transaction counts (with connection checks)
+    legit_count = 0
+    fraud_count = 0
+    if legit_collection is not None:
+        legit_count = legit_collection.count_documents({"User_ID": st.session_state.user_id})
+    if fraud_collection is not None:
+        fraud_count = fraud_collection.count_documents({"User_ID": st.session_state.user_id})
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
         st.markdown(f"""
-        <div class="status-card status-success">
-            <h3 style="margin: 0;">Approved Transactions</h3>
-            <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700;">{legit_count}</p>
+        <div class="status-card" style="background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%); border-left: 4px solid #28a745;">
+            <h3 style="margin: 0; color: #155724;">APPROVED</h3>
+            <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700; color: #155724;">{legit_count}</p>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
         st.markdown(f"""
-        <div class="status-card status-danger">
-            <h3 style="margin: 0;">Flagged Transactions</h3>
-            <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700;">{fraud_count}</p>
+        <div class="status-card" style="background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%); border-left: 4px solid #dc3545;">
+            <h3 style="margin: 0; color: #721c24;">FLAGGED</h3>
+            <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700; color: #721c24;">{fraud_count}</p>
         </div>
         """, unsafe_allow_html=True)
     
     with col3:
         total = legit_count + fraud_count
         st.markdown(f"""
-        <div class="status-card">
-            <h3 style="margin: 0;">Total Transactions</h3>
-            <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700;">{total}</p>
+        <div class="status-card" style="background: linear-gradient(135deg, #fff8e1 0%, #fff3cd 100%); border-left: 4px solid #d4af37;">
+            <h3 style="margin: 0; color: #1a1a1a;">TOTAL TRANSACTIONS</h3>
+            <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700; color: #1a1a1a;">{total}</p>
         </div>
         """, unsafe_allow_html=True)
     
@@ -590,8 +616,8 @@ def render_2fa_verification(txn_data):
             return False
     
     st.markdown('<div class="twofa-container">', unsafe_allow_html=True)
-    st.markdown(f'<h3>{get_svg_icon("email", 20)} Email Verification Required</h3>', unsafe_allow_html=True)
-    st.markdown('<p>Please check your email and enter the 6-digit verification code to confirm this transaction.</p>', unsafe_allow_html=True)
+    st.markdown(f'<h3 style="color: #1a1a1a;">EMAIL VERIFICATION REQUIRED</h3>', unsafe_allow_html=True)
+    st.markdown('<p style="color: #333;">Please check your email and enter the 6-digit verification code to confirm this transaction.</p>', unsafe_allow_html=True)
     
     with st.form("2fa_form"):
         code = st.text_input("Verification Code", placeholder="Enter 6-digit code", max_chars=6)
@@ -603,23 +629,28 @@ def render_2fa_verification(txn_data):
                 txn = st.session_state.verification_txn
                 txn["legit_token"] = secrets.token_hex(8)
                 txn["Prediction"] = "Legit (2FA Verified)"
-                legit_collection.insert_one(txn)
+                
+                if legit_collection is not None:
+                    legit_collection.insert_one(txn)
                 
                 # Update user features in Redis
-                user_hash_key = f"user:{st.session_state.user_id}"
-                r.hset(user_hash_key, mapping={
-                    "Avg_Amount": txn["Amount"],
-                    "Active_Loan_Count": txn["Active_Loans"],
-                    "Transactions_Per_Day": 1,
-                    "Velocity": 0,
-                    "Large_Transaction_Frequency": 0,
-                    "Large_Transaction_Flag": 0
-                })
-                r.hincrby(user_hash_key, "Transaction_Count", 1)
+                if r is not None:
+                    user_hash_key = f"user:{st.session_state.user_id}"
+                    r.hset(user_hash_key, mapping={
+                        "Avg_Amount": txn["Amount"],
+                        "Active_Loan_Count": txn["Active_Loans"],
+                        "Transactions_Per_Day": 1,
+                        "Velocity": 0,
+                        "Large_Transaction_Frequency": 0,
+                        "Large_Transaction_Flag": 0
+                    })
+                    r.hincrby(user_hash_key, "Transaction_Count", 1)
                 
                 st.success("✓ Transaction verified and processed successfully")
                 st.session_state.verification_code = None
                 st.session_state.verification_txn = None
+                st.session_state.transaction_in_progress = False
+                time.sleep(1)
                 st.rerun()
                 return True
             else:
@@ -628,6 +659,7 @@ def render_2fa_verification(txn_data):
                     st.error("Too many failed attempts. Transaction cancelled.")
                     st.session_state.verification_code = None
                     st.session_state.verification_txn = None
+                    st.session_state.transaction_in_progress = False
                     return False
                 else:
                     st.error("Invalid verification code. Please try again.")
@@ -637,6 +669,33 @@ def render_2fa_verification(txn_data):
     return False
 
 # -------------------------------
+# Session Time Helper
+# -------------------------------
+def get_user_avg_session_time(user_id):
+    """Get average session time for user from historical data"""
+    try:
+        # Query MongoDB for historical transactions
+        if legit_collection is None:
+            return 60.0
+        
+        user_txns = list(legit_collection.find(
+            {"User_ID": user_id},
+            {"Session_Time": 1}
+        ).limit(20))
+        
+        if user_txns and len(user_txns) > 0:
+            sessions = [float(t.get("Session_Time", 0)) for t in user_txns]
+            valid_sessions = [s for s in sessions if s > 0]
+            if valid_sessions:
+                avg = np.mean(valid_sessions)
+                return float(avg)
+    except Exception as e:
+        print(f"⚠️ Error getting user session time: {e}")
+    
+    # Fallback: typical session time
+    return 60.0  # 1 minute default
+
+# -------------------------------
 # Transaction Page
 # -------------------------------
 def render_transaction():
@@ -644,17 +703,23 @@ def render_transaction():
     if st.session_state.session_timer_started and st.session_state.start_time:
         elapsed_time = int(time.time() - st.session_state.start_time)
         st.markdown(f"""
-        <div style="background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); 
+        <div style="background: linear-gradient(135deg, #fffbf0 0%, #fff5e1 100%); 
                     padding: 15px; border-radius: 10px; margin-bottom: 20px; 
-                    border-left: 4px solid #2196f3; text-align: center;">
-            <div style="font-size: 18px; font-weight: 600; color: #1976d2;">
-                Session Time: {elapsed_time} seconds
+                    border-left: 4px solid #d4af37; text-align: center;">
+            <div style="font-size: 18px; font-weight: 600; color: #1a1a1a;">
+                SESSION TIME: {elapsed_time} seconds
             </div>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'<div class="card-header">New Transaction</div>', unsafe_allow_html=True)
+    
+    # Check if databases are available
+    if r is None or legit_collection is None or fraud_collection is None:
+        st.error("⚠️ Database connections are not available. Please try again later.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
     
     with st.form("txn_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
@@ -673,87 +738,110 @@ def render_transaction():
         st.markdown("<br>", unsafe_allow_html=True)
         submit_txn = st.form_submit_button("Process Transaction")
         
-        if submit_txn and amount > 0:
-            now = datetime.datetime.now()
-            txn_id = str(uuid.uuid4())
-            elapsed_time = int(time.time() - st.session_state.start_time) if st.session_state.start_time else 0
-            
-            data = {
-                "Transaction_ID": txn_id,
-                "User_ID": st.session_state.user_id,
-                "Date": now.strftime("%Y-%m-%d"),
-                "Time": now.strftime("%H:%M:%S"),
-                "Amount": float(amount),
-                "Merchant_Category": merchant or "Other",
-                "Device_Type": get_device_type(),
-                "Active_Loans": st.session_state.active_loans if st.session_state.active_loans is not None else 0,
-                "Session_Time": elapsed_time
-            }
-            
-            # Send to Redis stream
-            r.xadd(stream_name, {"data": str(data)})
-            
-            st.success("✓ Transaction submitted for processing")
-            
-            # Real-time prediction polling
-            st.markdown("**Processing Transaction...**")
-            progress_bar = st.progress(0)
-            status_placeholder = st.empty()
-            
-            prediction = None
-            timeout = time.time() + 15  # 15 second timeout
-            progress = 0
-            
-            while time.time() < timeout and prediction is None:
-                # Check fraud collection
-                result = fraud_collection.find_one({"Transaction_ID": txn_id})
-                if result:
-                    prediction = result.get("Prediction", "Fraud")
-                    collection_type = "fraud"
-                    break
+        if submit_txn and amount > 0 and merchant:
+            try:
+                now = datetime.datetime.now()
+                txn_id = str(uuid.uuid4())
                 
-                # Check legit collection
-                result = legit_collection.find_one({"Transaction_ID": txn_id})
-                if result:
-                    prediction = result.get("Prediction", "Legit")
-                    collection_type = "legit"
-                    break
+                # Calculate session time with proper error handling
+                elapsed_time = int(time.time() - st.session_state.start_time) if st.session_state.start_time else 0
+                user_avg_session = get_user_avg_session_time(st.session_state.user_id)
                 
-                progress = min(progress + 7, 95)
-                progress_bar.progress(progress)
-                status_placeholder.info("Analyzing transaction patterns...")
-                time.sleep(1)
-            
-            progress_bar.progress(100)
-            
-            if prediction:
-                if prediction.lower() == "fraud":
-                    st.markdown(f"""
-                    <div class="status-card status-danger">
-                        <h3 style="margin: 0;">Transaction Flagged</h3>
-                        <p style="margin: 5px 0 0 0; font-size: 16px;">Status: <strong>{prediction}</strong></p>
-                        <p style="margin: 5px 0 0 0; font-size: 14px;">This transaction has been flagged for manual review.</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                elif prediction.lower() == "suspicious":
-                    # Show 2FA verification
-                    if not render_2fa_verification(data):
-                        return
+                # Use weighted average: 70% historical, 30% current UI elapsed
+                # Cap to reasonable range (10s - 300s)
+                if user_avg_session > 0:
+                    expected_session = int(0.7 * user_avg_session + 0.3 * max(elapsed_time, 10))
+                    session_time = min(expected_session, 300)
+                else:
+                    session_time = min(max(elapsed_time, 10), 300)
+                
+                print(f"📊 Session time - Elapsed: {elapsed_time}s, User Avg: {user_avg_session:.1f}s, Final: {session_time}s")
+                
+                data = {
+                    "Transaction_ID": txn_id,
+                    "User_ID": st.session_state.user_id,
+                    "Date": now.strftime("%Y-%m-%d"),
+                    "Time": now.strftime("%H:%M:%S"),
+                    "Amount": float(amount),
+                    "Merchant_Category": merchant or "Other",
+                    "Device_Type": get_device_type(),
+                    "Active_Loans": st.session_state.active_loans if st.session_state.active_loans is not None else 0,
+                    "Session_Time": session_time
+                }
+                
+                # Send to Redis stream
+                r.xadd(stream_name, {"data": str(data)})
+                st.session_state.transaction_in_progress = True
+                
+                st.success("✓ Transaction submitted for processing")
+                
+                # Real-time prediction polling
+                st.markdown("**Processing Transaction...**")
+                progress_bar = st.progress(0)
+                status_placeholder = st.empty()
+                
+                prediction = None
+                collection_type = None
+                timeout = time.time() + 15  # 15 second timeout
+                progress = 0
+                
+                while time.time() < timeout and prediction is None:
+                    # Check fraud collection
+                    result = fraud_collection.find_one({"Transaction_ID": txn_id})
+                    if result:
+                        prediction = result.get("Prediction", "Fraud")
+                        collection_type = "fraud"
+                        break
+                    
+                    # Check legit collection
+                    result = legit_collection.find_one({"Transaction_ID": txn_id})
+                    if result:
+                        prediction = result.get("Prediction", "Legit")
+                        collection_type = "legit"
+                        break
+                    
+                    progress = min(progress + 7, 95)
+                    progress_bar.progress(progress)
+                    status_placeholder.info("Analyzing transaction patterns...")
+                    time.sleep(1)
+                
+                progress_bar.progress(100)
+                
+                if prediction:
+                    if prediction.lower() == "fraud":
+                        st.markdown(f"""
+                        <div class="status-card" style="background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%); border-left: 4px solid #dc3545;">
+                            <h3 style="margin: 0; color: #721c24;">TRANSACTION FLAGGED</h3>
+                            <p style="margin: 5px 0 0 0; font-size: 16px; color: #721c24;">Status: <strong>{prediction}</strong></p>
+                            <p style="margin: 5px 0 0 0; font-size: 14px; color: #721c24;">This transaction has been flagged for manual review.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        st.session_state.transaction_in_progress = False
+                    elif prediction.lower() == "suspicious":
+                        # Show 2FA verification
+                        render_2fa_verification(data)
+                    else:
+                        st.markdown(f"""
+                        <div class="status-card" style="background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%); border-left: 4px solid #28a745;">
+                            <h3 style="margin: 0; color: #155724;">TRANSACTION APPROVED</h3>
+                            <p style="margin: 5px 0 0 0; font-size: 16px; color: #155724;">Status: <strong>{prediction}</strong></p>
+                            <p style="margin: 5px 0 0 0; font-size: 14px; color: #155724;">Your transaction has been processed successfully.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        st.session_state.transaction_in_progress = False
                 else:
                     st.markdown(f"""
-                    <div class="status-card status-success">
-                        <h3 style="margin: 0;">✓ Transaction Approved</h3>
-                        <p style="margin: 5px 0 0 0; font-size: 16px;">Status: <strong>{prediction}</strong></p>
-                        <p style="margin: 5px 0 0 0; font-size: 14px;">Your transaction has been processed successfully.</p>
+                    <div class="status-card" style="background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%); border-left: 4px solid #ffc107;">
+                        <h3 style="margin: 0; color: #856404;">PROCESSING TIMEOUT</h3>
+                        <p style="margin: 5px 0 0 0; font-size: 14px; color: #856404;">Transaction is still being processed. Please check your transaction history.</p>
                     </div>
                     """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                <div class="status-card status-warning">
-                    <h3 style="margin: 0;">⏳ Processing Timeout</h3>
-                    <p style="margin: 5px 0 0 0; font-size: 14px;">Transaction is still being processed. Please check your transaction history.</p>
-                </div>
-                """, unsafe_allow_html=True)
+                    st.session_state.transaction_in_progress = False
+            
+            except Exception as e:
+                st.error(f"❌ Error processing transaction: {str(e)}")
+                print(f"Transaction error: {e}")
+                st.session_state.transaction_in_progress = False
     
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -764,11 +852,30 @@ def render_history():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'<div class="card-header">Transaction History</div>', unsafe_allow_html=True)
     
-    # Get transactions
-    legit_txns = list(legit_collection.find({"User_ID": st.session_state.user_id}).sort("Date", -1).sort("Time", -1))
-    fraud_txns = list(fraud_collection.find({"User_ID": st.session_state.user_id}).sort("Date", -1).sort("Time", -1))
+    # Get transactions (with connection checks)
+    legit_txns = []
+    fraud_txns = []
     
-    tab1, tab2 = st.tabs(["✅ Approved Transactions", "🚨 Flagged Transactions"])
+    if legit_collection is not None:
+        try:
+            legit_txns = list(legit_collection.find({"User_ID": st.session_state.user_id}).sort("Date", -1).sort("Time", -1))
+        except Exception as e:
+            st.warning(f"⚠️ Error loading approved transactions: {str(e)}")
+    
+    if fraud_collection is not None:
+        try:
+            fraud_txns = list(fraud_collection.find({"User_ID": st.session_state.user_id}).sort("Date", -1).sort("Time", -1))
+        except Exception as e:
+            st.warning(f"⚠️ Error loading flagged transactions: {str(e)}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("APPROVED", len(legit_txns))
+    with col2:
+        st.metric("FLAGGED", len(fraud_txns))
+    
+    st.markdown("---")
+    tab1, tab2 = st.tabs(["APPROVED TRANSACTIONS", "FLAGGED TRANSACTIONS"])
     
     with tab1:
         if legit_txns:
@@ -778,9 +885,9 @@ def render_history():
                 clean_txn = {k: v for k, v in txn.items() if k != '_id'}
                 clean_txn['Amount'] = f"₹{clean_txn['Amount']:.2f}"
                 display_data.append(clean_txn)
-            st.dataframe(display_data, use_container_width=True)
+            st.dataframe(display_data, use_container_width=True, hide_index=True)
         else:
-            st.info("No approved transactions found.")
+            st.info("No approved transactions found yet.")
     
     with tab2:
         if fraud_txns:
@@ -790,7 +897,7 @@ def render_history():
                 clean_txn = {k: v for k, v in txn.items() if k != '_id'}
                 clean_txn['Amount'] = f"₹{clean_txn['Amount']:.2f}"
                 display_data.append(clean_txn)
-            st.dataframe(display_data, use_container_width=True)
+            st.dataframe(display_data, use_container_width=True, hide_index=True)
         else:
             st.info("No flagged transactions found.")
     
@@ -802,6 +909,13 @@ def render_history():
 def main():
     # Render header
     render_header()
+    
+    # Show connection status warnings
+    if fraud_collection is None or legit_collection is None:
+        st.warning("⚠️ MongoDB is not available. Transaction history will not work. Please ensure MongoDB is running on localhost:27017")
+    
+    if r is None:
+        st.warning("⚠️ Redis is not available. Real-time transaction processing will not work. Please ensure Redis is running on localhost:6379")
     
     # Handle navigation and page rendering
     if not st.session_state.logged_in:

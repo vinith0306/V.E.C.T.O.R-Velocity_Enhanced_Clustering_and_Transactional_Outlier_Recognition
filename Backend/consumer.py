@@ -10,6 +10,16 @@ from datetime import datetime, timedelta
 from trigger import generate_user_cluster_hashmap
 from sklearn.preprocessing import StandardScaler
 from collections import defaultdict
+from common_constants import (
+    FEATURE_KEYS,
+    MERCHANT_MAP,
+    DEVICE_MAP,
+    PAYMENT_METHOD_MAP,
+    NUM_FEATURES,
+    ANOMALY_THRESHOLD,
+    build_feature_array,
+    validate_feature_vector
+)
 
 # ========== MongoDB Setup ==========
 mongo_client = pymongo.MongoClient("mongodb://localhost:27017/")
@@ -24,28 +34,6 @@ last_ids = {
     "csv_to_producer": '0-0',
     "custom_input_stream": '0-0'
 }
-
-# ========== Merchant & Device Encoding ==========
-MERCHANT_MAP = {
-    'Luxury Goods': 0,
-    'Travel': 1,
-    'Electronics': 2,
-    'Apparel': 3,
-    'Food Delivery': 4,
-    'Online Services': 5,
-    'Groceries': 6,
-    'Utilities': 7,
-    'Medical': 8,
-    'Wellness': 9,
-    'Organic Grocery': 10,
-    'Jewelry': 11,
-    'Health': 12,
-    'Hygiene Products': 13,
-    'Apparel (gifts)': 14,
-    'Food': 15,
-    'Apparel Deals': 16
-}
-DEVICE_MAP = {'Mobile': 0, 'PC': 1, 'Tablet': 2}
 
 # ========== Trigger & Cluster Load ==========
 print("🔁 Triggering cluster re-training...")
@@ -64,31 +52,49 @@ except FileNotFoundError:
 # ========== Suspicion Buffers ==========
 suspicion_buffers = defaultdict(list)
 
-# ========== Dynamic Feature Extraction ==========
+# ========== Dynamic Feature Extraction with Sensible Defaults ==========
 def compute_dynamic_features(user_id, amount, date_str, time_str):
+    """Compute dynamic features for a transaction, with fallbacks for new users"""
     hash_key = f"user:{user_id}"
     today = date_str
     timestamp = f"{date_str} {time_str}"
     dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
 
-    avg_amt = float(r.hget(hash_key, "Avg_Amount") or 0)
-    last_large_date = r.hget(hash_key, "Last_Large_Date")
-    today_count = int(r.hget(f"{hash_key}:tx:{today}", "count") or 0)
-
-    avg_amt = round((avg_amt + amount) / 2, 2) if avg_amt > 0 else amount
+    # FIX #1: Sensible defaults for new users (BUG #1)
+    avg_amt_redis = r.hget(hash_key, "Avg_Amount")
+    if avg_amt_redis:
+        avg_amt = float(avg_amt_redis)
+        avg_amt = round((avg_amt + amount) / 2, 2)
+    else:
+        # NEW USER: Use current amount as baseline
+        avg_amt = float(amount)
+    
     r.hincrby(f"{hash_key}:tx:{today}", "count", 1)
 
     yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
     y_count = int(r.hget(f"{hash_key}:tx:{yesterday}", "count") or 0)
-    tx_per_day = round((today_count + y_count) / 2, 2)
+    today_count = int(r.hget(f"{hash_key}:tx:{today}", "count") or 0)
+    
+    # For new users, use sensible default of 1.0 instead of 0
+    if y_count > 0 or today_count > 1:
+        tx_per_day = round((today_count + y_count) / 2, 2)
+    else:
+        tx_per_day = 1.0
 
     month_key = dt.strftime("%Y-%m")
     r.hincrby(f"{hash_key}:velocity:{month_key}", "count", 1)
     velocity_data = r.hgetall(f"{hash_key}:velocity:{month_key}")
-    monthly_counts = [int(v) for v in velocity_data.values()] if velocity_data else [1]
-    velocity = round(np.mean(monthly_counts), 2) if monthly_counts else 1.0
+    
+    # For new users, use sensible default of 1.0 instead of 0
+    if velocity_data:
+        monthly_counts = [int(v) for v in velocity_data.values()]
+        velocity = round(np.mean(monthly_counts), 2)
+    else:
+        velocity = 1.0
 
     large_txn_flag = 1 if amount > 1.5 * avg_amt else 0
+    last_large_date = r.hget(hash_key, "Last_Large_Date")
+    
     if large_txn_flag:
         if last_large_date:
             last = datetime.strptime(last_large_date, "%Y-%m-%d")
@@ -108,6 +114,8 @@ def compute_dynamic_features(user_id, amount, date_str, time_str):
         "Large_Transaction_Flag": large_txn_flag,
         "Large_Transaction_Frequency": ltf
     }
+
+
 
 # ========== Main Listener ==========
 print(f"👂 Listening on Redis streams: {list(last_ids.keys())}")
@@ -149,29 +157,48 @@ while True:
                         date_str = tx.get("Date", "")
                         time_str = tx.get("Time", "")
 
-                        merchant_code = MERCHANT_MAP.get(merchant, 0)
-                        device_code = DEVICE_MAP.get(device, 0)
+                        # FIX #1 & #4: Validate merchant and device categories
+                        # Map unknown categories to sensible defaults instead of 0 (Luxury Goods)
+                        if merchant not in MERCHANT_MAP:
+                            print(f"⚠️ Warning: Unknown merchant '{merchant}', mapping to 'Online Services'")
+                            merchant = "Online Services"
+                        
+                        if device not in DEVICE_MAP:
+                            print(f"⚠️ Warning: Unknown device '{device}', mapping to 'Mobile'")
+                            device = "Mobile"
+
+                        merchant_code = MERCHANT_MAP.get(merchant, MERCHANT_MAP["UNKNOWN"])
+                        device_code = DEVICE_MAP.get(device, DEVICE_MAP["UNKNOWN"])
 
                         features = compute_dynamic_features(user_id, amount, date_str, time_str)
 
+                        # FIX #2: Build feature vector in EXACT FEATURE_KEYS order
+                        # This dictionary MUST have every key in FEATURE_KEYS
                         feature_vector = {
-                            "Amount": amount,
+                            "Amount": float(amount),
                             "Avg_Amount": features["Avg_Amount"],
-                            "Active_Loan_Count": active_loans,
-                            "Session_Time": session_time,
+                            "Active_Loan_Count": float(active_loans),
+                            "Session_Time": float(session_time),
                             "Transactions_Per_Day": features["Transactions_Per_Day"],
                             "Velocity": features["Velocity"],
                             "Large_Transaction_Flag": features["Large_Transaction_Flag"],
                             "Large_Transaction_Frequency": features["Large_Transaction_Frequency"],
-                            "Merchant_Type_Code": merchant_code,
-                            "Device_Type_Code": device_code
+                            "Merchant_Type_Code": float(merchant_code),
+                            "Device_Type_Code": float(device_code)
                         }
+
+                        # Validate and build feature array (CRITICAL: exact order)
+                        try:
+                            validate_feature_vector(feature_vector)
+                            X = build_feature_array(feature_vector)
+                        except ValueError as e:
+                            print(f"❌ Feature validation failed: {e}")
+                            continue
 
                         cluster_info = user_cluster_map.get(user_id)
                         cluster = cluster_info["Cluster"] if cluster_info else None
                         if cluster == -1:
                             cluster = None  # treat as unassigned → fallback
-                        X = np.array([feature_vector[k] for k in feature_vector]).reshape(1, -1)
 
                         # ------------------ Model Prediction ------------------
                         fallback_used = False
@@ -179,36 +206,39 @@ while True:
                             try:
                                 model_bundle = joblib.load(f"cluster_models/cluster_{cluster}_bundle.pkl")
                                 model, scaler, score_min, score_max = model_bundle
+                                
+                                # FIX #6: Validate score range
+                                if np.isnan(score_min) or np.isnan(score_max) or np.isinf(score_min) or np.isinf(score_max):
+                                    print(f"⚠️ Warning: Invalid score range for cluster {cluster}")
+                                    score_min, score_max = -1.0, 1.0
+                                
                                 X_scaled = scaler.transform(X)
-
                                 score = model.decision_function(X_scaled)[0]
 
                                 # Normalize using actual training score range
                                 if score_max != score_min:
                                     prob = (score - score_min) / (score_max - score_min)
+                                    prob = max(0.0, min(1.0, prob))  # Clamp to [0, 1]
                                 else:
-                                    prob = 0.5  # fallback if all training scores were same
+                                    prob = 0.5
+                                pred = 1 if prob > ANOMALY_THRESHOLD else 0
 
                             except FileNotFoundError:
                                 if fallback_model and fallback_scaler:
                                     fallback_used = True
                                     cluster = "Fallback"
-
-                                    fallback_vector = np.array([[
-                                        amount,
-                                        active_loans,
-                                        session_time,
-                                        feature_vector["Transactions_Per_Day"],        # → Transactions_Per_Unit_Time
-                                        feature_vector["Velocity"],
-                                        feature_vector["Large_Transaction_Flag"],      # → High_Value_Transaction
-                                        feature_vector["Large_Transaction_Frequency"], # → Large_Transaction_Freq
-                                        merchant_code,                                 # → Payment_Method
-                                        device_code                                    # → Device_Type
-                                    ]])
-
-                                    X_scaled = fallback_scaler.transform(fallback_vector)
-                                    pred = fallback_model.predict(X_scaled)[0]
-                                    prob = 1.0 if pred == 1 else 0.0
+                                    # FIX #2: Use EXACT same feature vector as cluster models
+                                    X_scaled = fallback_scaler.transform(X)
+                                    # Use predict_proba for XGBoost to get probability scores
+                                    try:
+                                        prob_scores = fallback_model.predict_proba(X_scaled)[0]
+                                        # prob_scores = [prob_class_0, prob_class_1]
+                                        prob = float(prob_scores[1])  # Probability of class 1 (anomaly)
+                                        pred = 1 if prob > ANOMALY_THRESHOLD else 0
+                                    except AttributeError:
+                                        # Fallback if model doesn't support predict_proba
+                                        pred = fallback_model.predict(X_scaled)[0]
+                                        prob = float(pred)  # 0 or 1
                                 else:
                                     print("⚠️ No model or fallback available.")
                                     pred = None
@@ -217,31 +247,18 @@ while True:
                         elif fallback_model and fallback_scaler:
                             fallback_used = True
                             cluster = "Fallback"
-
-                            # Fallback prediction logic
-                            payment_method = tx.get("Payment_Method", "Credit Card")
-                            PAYMENT_METHOD_MAP = {'Credit Card': 0, 'Debit Card': 1, 'UPI': 2, 'Net Banking': 3, 'Wallet': 4}
-                            payment_method_code = PAYMENT_METHOD_MAP.get(payment_method, 0)
-
-                            transactions_per_unit_time = feature_vector["Transactions_Per_Day"]
-                            high_value_transaction = feature_vector["Large_Transaction_Flag"]
-                            large_transaction_freq = feature_vector["Large_Transaction_Frequency"]
-
-                            fallback_vector = np.array([[
-                                amount,
-                                active_loans,
-                                session_time,
-                                transactions_per_unit_time,
-                                feature_vector["Velocity"],
-                                high_value_transaction,
-                                large_transaction_freq,
-                                payment_method_code,
-                                device_code
-                            ]])
-
-                            X_scaled = fallback_scaler.transform(fallback_vector)
-                            pred = fallback_model.predict(X_scaled)[0]
-                            prob = 1.0 if pred == 1 else 0.0
+                            # FIX #2: Use EXACT same feature vector (same 10 columns, same order)
+                            X_scaled = fallback_scaler.transform(X)
+                            # Use predict_proba for XGBoost to get probability scores (anomaly likelihood)
+                            try:
+                                prob_scores = fallback_model.predict_proba(X_scaled)[0]
+                                # prob_scores = [prob_class_0, prob_class_1]
+                                prob = float(prob_scores[1])  # Probability of class 1 (anomaly)
+                                pred = 1 if prob > ANOMALY_THRESHOLD else 0
+                            except AttributeError:
+                                # Fallback if model doesn't support predict_proba
+                                pred = fallback_model.predict(X_scaled)[0]
+                                prob = float(pred)  # 0 or 1 
 
                         else:
                             print("⚠️ No cluster or fallback model available.")
@@ -285,13 +302,17 @@ while True:
                             tx["legit_token"] = secrets.token_hex(8)
                             legit_collection.insert_one(tx)
                             user_hash_key = f"user:{user_id}"
+                            # FIX #5: Store ALL model-required fields in Redis hash
+                            # This prevents defaults (0) from being used on next transactions
                             r.hset(user_hash_key, mapping={
                                 "Avg_Amount": feature_vector["Avg_Amount"],
                                 "Active_Loan_Count": feature_vector["Active_Loan_Count"],
                                 "Transactions_Per_Day": feature_vector["Transactions_Per_Day"],
                                 "Velocity": feature_vector["Velocity"],
                                 "Large_Transaction_Frequency": feature_vector["Large_Transaction_Frequency"],
-                                "Large_Transaction_Flag": feature_vector["Large_Transaction_Flag"]
+                                "Large_Transaction_Flag": feature_vector["Large_Transaction_Flag"],
+                                "Merchant_Type_Code": feature_vector["Merchant_Type_Code"],
+                                "Device_Type_Code": feature_vector["Device_Type_Code"],
                             })
                             r.hincrby(user_hash_key, "Transaction_Count", 1)
 

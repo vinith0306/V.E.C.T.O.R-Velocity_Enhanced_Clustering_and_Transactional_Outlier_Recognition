@@ -9,51 +9,24 @@ from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 import umap
 import hdbscan
+from xgboost import XGBClassifier
 from collections import defaultdict
 from datetime import datetime, timedelta
+from common_constants import (
+    FEATURE_KEYS,
+    MERCHANT_MAP,
+    DEVICE_MAP,
+    NUM_FEATURES,
+    ANOMALY_THRESHOLD,
+    validate_feature_vector,
+    build_feature_array
+)
 
 # ========== Constants ==========
 JSON_FILE = "user_feature_data.json"
 CLUSTER_MAP_FILE = "user_cluster_mapping.json"
 MODEL_DIR = "cluster_models"
 FRAUD_CSV = "transactions.csv"
-
-# ========== CRITICAL: Match consumer.py features exactly ==========
-FEATURE_KEYS = [
-    'Amount',                    # Raw transaction amount (average)
-    'Avg_Amount',               # Rolling average amount
-    'Active_Loan_Count',        # Number of active loans
-    'Session_Time',             # Average session time
-    'Transactions_Per_Day',     # Average transactions per day
-    'Velocity',                 # Transaction velocity
-    'Large_Transaction_Flag',   # Large transaction indicator
-    'Large_Transaction_Frequency',  # Frequency of large transactions
-    'Merchant_Type_Code',       # Encoded merchant category
-    'Device_Type_Code'          # Encoded device type
-]
-
-# ========== Same encoding as consumer.py ==========
-MERCHANT_MAP = {
-    'Luxury Goods': 0,
-    'Travel': 1,
-    'Electronics': 2,
-    'Apparel': 3,
-    'Food Delivery': 4,
-    'Online Services': 5,
-    'Groceries': 6,
-    'Utilities': 7,
-    'Medical': 8,
-    'Wellness': 9,
-    'Organic Grocery': 10,
-    'Jewelry': 11,
-    'Health': 12,
-    'Hygiene Products': 13,
-    'Apparel (gifts)': 14,
-    'Food': 15,
-    'Apparel Deals': 16
-}
-
-DEVICE_MAP = {'Mobile': 0, 'PC': 1, 'Tablet': 2}
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -163,7 +136,7 @@ def extract_transaction_features(user_data):
         tx_features['Active_Loan_Count'] = float(row.get('Active_Loan_Count', 0))
         
         # Categorical features
-        merchant_code = MERCHANT_MAP.get(row.get('Merchant_Category', ''), 0)
+        merchant_code = MERCHANT_MAP.get(row.get('Merchant_Type', ''), 0)
         device_code = DEVICE_MAP.get(row.get('Device_Type', ''), 0)
         tx_features['Merchant_Type_Code'] = float(merchant_code)
         tx_features['Device_Type_Code'] = float(device_code)
@@ -229,8 +202,8 @@ def add_derived_features(centroid, all_data, normal_data, original_user_data):
 def fallback_simple_aggregation(user_data):
     """Fallback for users with very few transactions"""
     amounts = user_data['Amount'].astype(float)
-    session_times = user_data.get('Session_Time', pd.Series([0])).astype(float)
-    active_loans = user_data.get('Active_Loan_Count', pd.Series([0])).astype(int)
+    session_times = user_data['Session_Time'].astype(float) if 'Session_Time' in user_data.columns else pd.Series([0]).astype(float)
+    active_loans = user_data['Active_Loan_Count'].astype(float) if 'Active_Loan_Count' in user_data.columns else pd.Series([0]).astype(float)
     
     # Date processing for time-based features
     if 'Date' in user_data.columns:
@@ -250,11 +223,13 @@ def fallback_simple_aggregation(user_data):
     large_txn_flag = 1 if len(large_txns) > 0 else 0
     
     # Merchant and device encoding
-    merchant_categories = user_data.get('Merchant_Category', pd.Series(['']))
-    device_types = user_data.get('Device_Type', pd.Series(['']))
+    merchant_categories = user_data['Merchant_Type'] if 'Merchant_Type' in user_data.columns else pd.Series([''])
+    device_types = user_data['Device_Type'] if 'Device_Type' in user_data.columns else pd.Series([''])
     
-    most_common_merchant = merchant_categories.mode().iloc[0] if len(merchant_categories.mode()) > 0 else ''
-    most_common_device = device_types.mode().iloc[0] if len(device_types.mode()) > 0 else ''
+    merchant_mode = merchant_categories.mode()
+    most_common_merchant = merchant_mode.iloc[0] if len(merchant_mode) > 0 else ''
+    device_mode = device_types.mode()
+    most_common_device = device_mode.iloc[0] if len(device_mode) > 0 else ''
     
     merchant_code = MERCHANT_MAP.get(most_common_merchant, 0)
     device_code = DEVICE_MAP.get(most_common_device, 0)
@@ -417,6 +392,100 @@ def generate_user_cluster_hashmap():
         noise_label = " (Noise)" if cluster_id == -1 else ""
         print(f"   Cluster {cluster_id}{noise_label}: {count} users")
 
+    # Step 5.5: FIXED - Train Fallback XGBoost Model on all data
+    print("\n🚀 Training fallback XGBoost model on all transactions...")
+    try:
+        df_all = pd.read_csv(FRAUD_CSV)
+        df_all = df_all.dropna(subset=["User_ID", "Amount", "Date"])
+        
+        # Feature engineering for fallback
+        df_all['Amount'] = df_all['Amount'].astype(float)
+        df_all['Avg_Amount'] = df_all.groupby('User_ID')['Amount'].transform('mean')
+        df_all['Active_Loan_Count'] = df_all['Active_Loan_Count'].astype(float)
+        df_all['Session_Time'] = df_all['Session_Time'].astype(float)
+        
+        # Process merchant and device codes
+        df_all['Merchant_Type_Code'] = df_all['Merchant_Type'].map(MERCHANT_MAP).fillna(0)
+        df_all['Device_Type_Code'] = df_all['Device_Type'].map(DEVICE_MAP).fillna(0)
+        
+        # Timestamp processing
+        df_all['Date'] = pd.to_datetime(df_all['Date'], errors='coerce')
+        df_all['Tx_Date'] = df_all['Date'].dt.date
+        
+        # Calculate transactions per day
+        tx_per_day = df_all.groupby(['User_ID', 'Tx_Date']).size().groupby('User_ID').mean()
+        df_all['Transactions_Per_Day'] = df_all['User_ID'].map(tx_per_day).fillna(1.0)
+        
+        # Calculate velocity
+        months_per_user = df_all.groupby('User_ID')['Date'].apply(lambda x: x.dt.to_period('M').nunique())
+        velocity = df_all.groupby('User_ID').size() / months_per_user.replace(0, 1)
+        df_all['Velocity'] = df_all['User_ID'].map(velocity).fillna(1.0)
+        
+        # Calculate large transaction features
+        df_all['Large_Transaction_Flag'] = 0.0
+        df_all['Large_Transaction_Frequency'] = 30.0
+        
+        for user_id in df_all['User_ID'].unique():
+            user_mask = df_all['User_ID'] == user_id
+            user_amounts = df_all.loc[user_mask, 'Amount']
+            
+            if len(user_amounts) > 0:
+                avg_amt = user_amounts.mean()
+                large_threshold = avg_amt * 1.5
+                large_txns = user_amounts[user_amounts > large_threshold]
+                
+                flag = 1.0 if len(large_txns) > 0 else 0.0
+                df_all.loc[user_mask, 'Large_Transaction_Flag'] = flag
+                
+                if len(large_txns) > 1:
+                    user_dates = df_all.loc[user_mask, 'Date'].sort_values()
+                    large_dates = df_all.loc[user_mask & (df_all['Amount'] > large_threshold), 'Date']
+                    if len(large_dates) > 1:
+                        date_diffs = large_dates.sort_values().diff().dt.days.dropna()
+                        if len(date_diffs) > 0:
+                            avg_freq = date_diffs.mean()
+                            df_all.loc[user_mask, 'Large_Transaction_Frequency'] = max(avg_freq, 1.0)
+        
+        # Create binary labels: use Anomaly column if available, else flag suspicious transactions
+        if 'Anomaly' in df_all.columns:
+            y_all = df_all['Anomaly'].astype(int)
+        else:
+            # Default: transactions with high Amount (outliers) are anomalies
+            amount_threshold = df_all['Amount'].quantile(0.95)
+            y_all = (df_all['Amount'] > amount_threshold).astype(int)
+        
+        # Build feature matrix
+        feature_matrix_all = df_all[FEATURE_KEYS].fillna(0).values
+        print(f"📊 Fallback training data shape: {feature_matrix_all.shape} with {y_all.sum()} anomalies")
+        
+        # Scale data
+        fallback_scaler = MinMaxScaler()
+        X_scaled_all = fallback_scaler.fit_transform(feature_matrix_all)
+        
+        # Train XGBoost classifier
+        fallback_model = XGBClassifier(
+            objective='binary:logistic',
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            verbosity=0
+        )
+        fallback_model.fit(X_scaled_all, y_all)
+        
+        # Save fallback model and scaler
+        joblib.dump(fallback_model, f"{MODEL_DIR}/fallback_xgboost_model.joblib")
+        joblib.dump(fallback_scaler, f"{MODEL_DIR}/fallback_scaler.joblib")
+        
+        print(f"✅ Fallback XGBoost model trained on {len(X_scaled_all)} transactions")
+        print(f"   📁 Model saved: {MODEL_DIR}/fallback_xgboost_model.joblib")
+        print(f"   📁 Scaler saved: {MODEL_DIR}/fallback_scaler.joblib")
+        
+    except Exception as e:
+        print(f"❌ Error training fallback XGBoost model: {e}")
+        import traceback
+        traceback.print_exc()
+
     # Step 6: FIXED - Train Isolation Forest models using all transactions per cluster
     print("📂 Loading all transactions for cluster-level training...")
     df = pd.read_csv(FRAUD_CSV)
@@ -531,9 +600,11 @@ def generate_user_cluster_hashmap():
 🏁 Clustering and Training Complete!
    📊 Total Users: {len(user_ids)}
    🎯 Clusters Found: {len([c for c in cluster_stats.keys() if c != -1])}
-   🤖 Models Trained: {trained_clusters}
+   🤖 Per-Cluster Models Trained: {trained_clusters}
+   🚀 Fallback XGBoost Model: Trained
    📁 Cluster mapping saved to: {CLUSTER_MAP_FILE}
    💾 User features saved to: {JSON_FILE}
+   📦 Models directory: {MODEL_DIR}/
    🔧 Used Trimmed K-Means for robust aggregation
     """)
 
