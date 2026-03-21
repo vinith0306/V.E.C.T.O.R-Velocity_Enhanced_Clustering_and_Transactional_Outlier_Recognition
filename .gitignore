@@ -1,0 +1,9 @@
+/venv
+/Backend/cluster_models/
+
+# Node.js dependencies
+node_modules/
+
+# Python cache folders
+__pycache__/
+**/__pycache__/
