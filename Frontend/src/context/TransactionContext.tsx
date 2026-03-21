@@ -10,6 +10,8 @@ import {
   DEVICE_TYPES 
 } from '../types';
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
 interface TransactionContextType {
   transactions: Transaction[];
   allTransactions: Transaction[];
@@ -80,7 +82,7 @@ export const TransactionProvider: React.FC<{ children: ReactNode }> = ({ childre
   useEffect(() => {
     const fetchInitialData = async () => {
       try {
-        const response = await axios.get('https://api.080405.tech/api/transactions');
+        const response = await axios.get(`${API_BASE_URL}/api/transactions`);
         const data = response.data;
         
         // Keep only latest 20 transactions for the main view

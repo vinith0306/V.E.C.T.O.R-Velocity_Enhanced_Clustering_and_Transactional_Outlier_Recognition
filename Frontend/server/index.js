@@ -20,6 +20,7 @@ app.use(express.json());
 // MongoDB connection
 const mongoURL = 'mongodb://localhost:27017';
 const dbName = 'RedisTransactions';
+const pollIntervalMs = Number(process.env.TXN_POLL_MS || 2000);
 let db;
 
 // Connect to MongoDB
@@ -31,7 +32,7 @@ async function connectToMongo() {
     db = client.db(dbName);
     
     // Setup change streams to watch for new transactions
-    setupChangeStreams();
+    await setupChangeStreams();
     
     return client;
   } catch (error) {
@@ -41,12 +42,20 @@ async function connectToMongo() {
 }
 
 // Setup change streams to watch for new transactions
-function setupChangeStreams() {
+async function setupChangeStreams() {
+  // Change streams require replica set or sharded cluster.
+  const hello = await db.admin().command({ hello: 1 });
+  if (!hello.setName) {
+    console.warn('MongoDB is not running as a replica set. Falling back to polling for realtime updates.');
+    startPollingFallback();
+    return;
+  }
+
   const fraudCollection = db.collection('fraud_transactions');
   const legitCollection = db.collection('legit_transactions');
   
-  const fraudChangeStream = fraudCollection.watch();
-  const legitChangeStream = legitCollection.watch();
+  const fraudChangeStream = fraudCollection.watch([], { fullDocument: 'updateLookup' });
+  const legitChangeStream = legitCollection.watch([], { fullDocument: 'updateLookup' });
   
   fraudChangeStream.on('change', async (change) => {
     if (change.operationType === 'insert') {
@@ -63,8 +72,69 @@ function setupChangeStreams() {
       io.emit('newTransaction', newTransaction);
     }
   });
+
+  const onChangeStreamError = (error) => {
+    console.error('Change stream error. Realtime updates disabled:', error.message);
+    fraudChangeStream.close().catch(() => {});
+    legitChangeStream.close().catch(() => {});
+  };
+
+  fraudChangeStream.on('error', onChangeStreamError);
+  legitChangeStream.on('error', onChangeStreamError);
   
   console.log('Change streams set up successfully');
+}
+
+// Standalone MongoDB fallback: poll for new inserts and emit them over sockets.
+function startPollingFallback() {
+  const collections = [
+    { name: 'fraud_transactions', label: 'fraud' },
+    { name: 'legit_transactions', label: 'legitimate' }
+  ];
+
+  const lastSeenByCollection = new Map();
+
+  const initialize = async () => {
+    for (const cfg of collections) {
+      const latest = await db.collection(cfg.name).find().sort({ _id: -1 }).limit(1).toArray();
+      lastSeenByCollection.set(cfg.name, latest[0]?._id || null);
+    }
+  };
+
+  const poll = async () => {
+    for (const cfg of collections) {
+      const lastSeen = lastSeenByCollection.get(cfg.name);
+      const query = lastSeen ? { _id: { $gt: lastSeen } } : {};
+
+      const newTransactions = await db
+        .collection(cfg.name)
+        .find(query)
+        .sort({ _id: 1 })
+        .toArray();
+
+      if (newTransactions.length > 0) {
+        for (const tx of newTransactions) {
+          console.log(`New ${cfg.label} transaction detected (polling):`, tx._id);
+          io.emit('newTransaction', tx);
+        }
+        lastSeenByCollection.set(cfg.name, newTransactions[newTransactions.length - 1]._id);
+      }
+    }
+  };
+
+  initialize()
+    .then(() => {
+      setInterval(() => {
+        poll().catch((error) => {
+          console.error('Polling fallback error:', error.message);
+        });
+      }, pollIntervalMs);
+
+      console.log(`Polling fallback started (${pollIntervalMs} ms interval)`);
+    })
+    .catch((error) => {
+      console.error('Failed to initialize polling fallback:', error.message);
+    });
 }
 
 // API Routes

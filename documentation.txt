@@ -512,7 +512,7 @@ b) Dynamic Features:
    sudo systemctl start redis
    sudo systemctl enable redis
    ```
-
+   sudo dnf install python3.11-devel gcc gcc-c++ make
 ### Backend Setup
 ---------------
 1. Create and activate virtual environment:
@@ -554,6 +554,7 @@ b) Dynamic Features:
 
 3. Start development server:
    ```bash
+   npm run server
    npm run dev
    ```
 
