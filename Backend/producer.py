@@ -20,8 +20,8 @@ for idx, row in df.iterrows():
     row_dict = {
         "User_ID": row["User_ID"],
         "Date": row["Date"],                # preserved from CSV
-        "Time": row["Time"],                # preserved from CSV
-        "Amount": str(row["Amount"]),
+        "Amount": str(row["Amount"]),                # preserved from CSV
+        "Time": row["Time"],
         "Merchant_Category": row["Merchant_Category"],
         "Device_Type": row["Device_Type"],
         "Session_Time": str(row["Session_Time"]),
