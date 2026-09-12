@@ -434,6 +434,136 @@ io.on('connection', (socket) => {
   });
 });
 
+// 9. Geographic Distribution Stats (for heatmap visualization)
+app.get('/api/bitcoin/geo-stats', async (req, res) => {
+  try {
+    // Try to read from ip_correlations collection first (populated by bulk_ingest)
+    const stored = await db.collection('bitcoin_ip_correlations').find().sort({ tx_count: -1 }).toArray();
+    if (stored.length > 0) {
+      return res.json(stored);
+    }
+
+    // Fallback: aggregate from transactions
+    const geoAgg = await db.collection('bitcoin_transactions').aggregate([
+      { $group: {
+          _id: '$geo_country',
+          tx_count: { $sum: 1 },
+          btc_volume: { $sum: '$total_output_btc' }
+      }},
+      { $sort: { tx_count: -1 } },
+      { $project: { country: '$_id', tx_count: 1, btc_volume: { $round: ['$btc_volume', 4] }, _id: 0 }}
+    ]).toArray();
+
+    if (geoAgg.length > 0) return res.json(geoAgg);
+
+    // Static fallback for demo
+    res.json([
+      { country: 'US', tx_count: 145, btc_volume: 234.56 },
+      { country: 'DE', tx_count: 89, btc_volume: 156.23 },
+      { country: 'RU', tx_count: 67, btc_volume: 445.12 },
+      { country: 'CN', tx_count: 54, btc_volume: 189.34 },
+      { country: 'NL', tx_count: 42, btc_volume: 312.78 },
+      { country: 'RO', tx_count: 38, btc_volume: 89.45 },
+      { country: 'SG', tx_count: 31, btc_volume: 67.89 },
+      { country: 'GB', tx_count: 28, btc_volume: 45.23 },
+      { country: 'JP', tx_count: 22, btc_volume: 34.56 },
+      { country: 'XX', tx_count: 19, btc_volume: 567.89 }
+    ]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 10. IP Correlation Data
+app.get('/api/bitcoin/ip-correlations', async (req, res) => {
+  try {
+    const entities = await db.collection('bitcoin_entities').find({
+      unique_ips: { $exists: true }
+    }).sort({ anonymity_score: -1 }).toArray();
+
+    // Build IP correlation summary
+    const torEntities = entities.filter(e => e.anonymity_score > 0.3);
+    const crossLinked = entities.filter(e => (e.cross_entity_links || 0) > 0);
+
+    res.json({
+      total_entities_with_ip: entities.length,
+      tor_using_entities: torEntities.length,
+      cross_linked_entities: crossLinked.length,
+      entities: entities.map(e => ({
+        entity_id: e.entity_id,
+        unique_ips: e.unique_ips || 0,
+        geo_countries: e.geo_countries || [],
+        anonymity_score: e.anonymity_score || 0,
+        cross_entity_links: e.cross_entity_links || 0,
+        is_seed_illicit: e.is_seed_illicit || false,
+        risk_score: e.risk_score || 0,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 11. Bulk File Ingestion Endpoint (CSV/JSON upload)
+app.post('/api/bitcoin/ingest', async (req, res) => {
+  try {
+    const { transactions } = req.body;
+    if (!transactions || !Array.isArray(transactions)) {
+      return res.status(400).json({ error: 'Request body must contain a "transactions" array' });
+    }
+
+    // Insert raw transactions with minimal processing (server-side)
+    const docs = transactions.map(tx => ({
+      ...tx,
+      timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+      risk_score: tx.risk_score || 0,
+      risk_level: tx.risk_level || 'LOW',
+      signals: tx.signals || [],
+      explanation: tx.explanation || '',
+      status: 'confirmed',
+    }));
+
+    await db.collection('bitcoin_transactions').insertMany(docs);
+
+    // Emit new transactions via socket
+    for (const doc of docs) {
+      io.emit('bitcoin:newTransaction', doc);
+    }
+
+    res.status(201).json({
+      ingested: docs.length,
+      message: `Successfully ingested ${docs.length} transactions`
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 12. Risk Propagation Data
+app.get('/api/bitcoin/risk-propagation', async (req, res) => {
+  try {
+    const entities = await db.collection('bitcoin_entities').find({
+      propagated_risk: { $exists: true, $gt: 0 }
+    }).sort({ propagated_risk: -1 }).toArray();
+
+    const seeds = entities.filter(e => e.is_seed_illicit);
+    const propagated = entities.filter(e => !e.is_seed_illicit && e.propagated_risk > 0);
+
+    res.json({
+      seed_count: seeds.length,
+      propagated_count: propagated.length,
+      seeds: seeds.map(e => ({ entity_id: e.entity_id, risk_score: e.risk_score })),
+      propagated_entities: propagated.map(e => ({
+        entity_id: e.entity_id,
+        propagated_risk: e.propagated_risk,
+        risk_score: e.risk_score,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start server
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {

@@ -1,11 +1,22 @@
 """
 Bitcoin Behavioral Heuristics & Pattern Detection
 Implements probabilistic heuristics (Peel Chains, Rapid Forwarding, Fan-In/Fan-Out,
-Dormant Awakening, Change Output) without claiming deterministic identity proof.
+Dormant Awakening, Change Output, CoinJoin/Mixing, Network-Layer Anomalies)
+without claiming deterministic identity proof.
 """
 
 from typing import Dict, Any, List, Optional
 import time
+
+# Import IP correlator utilities for network-layer checks
+try:
+    from bitcoin.ip_correlator import is_tor_exit, is_vpn_likely
+except ImportError:
+    def is_tor_exit(ip: str) -> bool:
+        return ip.startswith("10.255.") or ip.startswith("10.254.")
+    def is_vpn_likely(ip: str) -> bool:
+        return False
+
 
 class BitcoinRulesEngine:
     @staticmethod
@@ -64,11 +75,71 @@ class BitcoinRulesEngine:
         if in_count >= 2:
             signals.append("common_input_relationship")
 
+        # 8. CoinJoin Detection (many inputs + many equal-value outputs)
+        is_coinjoin = False
+        coinjoin_score = 0.0
+        if in_count >= 3 and out_count >= 3:
+            outs = tx.get("outputs", [])
+            if len(outs) >= 3:
+                out_vals = [round(o.get("value_btc", 0.0), 4) for o in outs if not o.get("is_op_return")]
+                if out_vals:
+                    # Count the most common output value
+                    val_counts: Dict[float, int] = {}
+                    for v in out_vals:
+                        val_counts[v] = val_counts.get(v, 0) + 1
+                    max_equal = max(val_counts.values()) if val_counts else 0
+                    equal_ratio = max_equal / len(out_vals)
+
+                    # CoinJoin: majority of outputs have equal value, many participants
+                    if max_equal >= 3 and equal_ratio >= 0.4:
+                        is_coinjoin = True
+                        coinjoin_score = min(1.0, equal_ratio * (max_equal / 5.0))
+                        signals.append("coinjoin_structure")
+                        rule_score += 30.0
+
+                        if in_count >= 5 and max_equal >= 5:
+                            signals.append("coinjoin_high_participant")
+                            rule_score += 10.0
+
+        # 9. Mixing Score (combination of CoinJoin, fan-out, rapid forwarding indicators)
+        mixing_score = 0.0
+        if is_coinjoin:
+            mixing_score = coinjoin_score * 0.6
+        if "rapid_forwarding" in signals:
+            mixing_score += 0.25
+        if "fan_out_dispersion" in signals:
+            mixing_score += 0.15
+        mixing_score = min(1.0, mixing_score)
+        if mixing_score > 0.5:
+            signals.append("mixing_detected")
+
+        # 10. Network-Layer Anomaly Detection
+        src_ip = tx.get("src_ip", "")
+        if src_ip:
+            # Tor exit node usage
+            if is_tor_exit(src_ip):
+                signals.append("tor_exit_node")
+                rule_score += 20.0
+
+            # VPN/hosting provider usage
+            if is_vpn_likely(src_ip):
+                signals.append("vpn_hosting_provider")
+                rule_score += 10.0
+
+        # 11. Geographic Mismatch (if entity has known country but tx relayed from different)
+        geo_country = tx.get("geo_country", "")
+        if geo_country == "XX":
+            signals.append("anonymized_origin")
+            rule_score += 15.0
+
         # Clamp rule score to [0, 100]
         rule_score = min(100.0, rule_score)
 
         return {
             "rule_score": round(rule_score, 2),
             "signals": signals,
-            "is_peel_chain": is_peel_chain
+            "is_peel_chain": is_peel_chain,
+            "is_coinjoin": is_coinjoin,
+            "coinjoin_score": round(coinjoin_score, 4),
+            "mixing_score": round(mixing_score, 4),
         }
